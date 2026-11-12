@@ -33,7 +33,7 @@ sudo ./install-hub.sh --url https://HUB_IP:8443   # hub; chiqqan o'rnatish kodi 
 # Panel → Sozlamalar → Agentlar → Token yaratish → chiqqan buyruqni Proxmox hostda (root) ishga tushiring
 ```
 
-Batafsil: [docs/ORNATISH.md](docs/ORNATISH.md).
+Bosqichma-bosqich qo'llanma: [docs/QOLLANMA.md](docs/QOLLANMA.md). Ma'lumotnoma: [docs/ORNATISH.md](docs/ORNATISH.md).
 
 ## Yig'ish (build)
 
