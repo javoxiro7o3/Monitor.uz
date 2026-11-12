@@ -1,0 +1,6 @@
+dist/
+*.db
+*.db-wal
+*.db-shm
+/monitor-hub
+/monitor-agent

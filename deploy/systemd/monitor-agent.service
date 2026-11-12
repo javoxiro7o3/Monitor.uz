@@ -1,0 +1,47 @@
+# Monitor.uz agent (host mode). Installed by install-agent.sh.
+# Read-only: reads /proc and /sys, opens no listening port, only outgoing
+# HTTPS to the hub.
+[Unit]
+Description=Monitor.uz agent
+Documentation=file:///usr/local/share/doc/monitor-uz/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor-agent
+Group=monitor-agent
+ExecStart=/usr/local/bin/monitor-agent run --mode=host --state-dir=/var/lib/monitor-agent
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StateDirectory=monitor-agent
+StateDirectoryMode=0750
+Nice=10
+
+# Hardening (systemd >= 247; Debian 12 has 252, Debian 13 has 257)
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+MemoryMax=100M
+
+[Install]
+WantedBy=multi-user.target
