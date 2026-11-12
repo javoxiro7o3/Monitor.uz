@@ -18,6 +18,12 @@ type Info struct {
 	CPUCores int    `json:"cpu_cores,omitempty"`
 	MemTotal uint64 `json:"mem_total,omitempty"`
 	BootTime int64  `json:"boot_time,omitempty"` // unix seconds
+	Arch     string `json:"arch,omitempty"`
+	// Guest interfaces with MACs, used to link a guest agent to its
+	// Proxmox VM/CT.
+	Ifaces []IfaceAddr `json:"ifaces,omitempty"`
+	// Capabilities found on the machine (ssacli, smartctl, ipmitool, docker).
+	Tools []string `json:"tools,omitempty"`
 }
 
 // Sample is one collection tick. Nil/empty sections mean "not available"
@@ -121,6 +127,20 @@ type PSI struct {
 type IngestRequest struct {
 	Info    *Info    `json:"info,omitempty"`
 	Samples []Sample `json:"samples"`
+	Reports *Reports `json:"reports,omitempty"`
+}
+
+// IngestResponse may ask the agent to update itself.
+type IngestResponse struct {
+	Update *UpdateOrder `json:"update,omitempty"`
+}
+
+// UpdateOrder tells an agent to download and switch to another binary
+// version (an admin approved it in the panel).
+type UpdateOrder struct {
+	Version string `json:"version"`
+	URL     string `json:"url"` // path on the hub, e.g. /dl/agent/0.2.0/monitor-agent-linux-amd64
+	SHA256  string `json:"sha256"`
 }
 
 // EnrollRequest exchanges a one-time install token for a permanent agent token.

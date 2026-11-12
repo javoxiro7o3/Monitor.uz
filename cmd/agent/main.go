@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 
 	"monitor.uz/internal/agent"
 	"monitor.uz/internal/collector"
+	"monitor.uz/internal/model"
 )
 
 var version = "dev"
@@ -64,7 +66,7 @@ func checkMode(mode string) error {
 	case "host":
 		return nil
 	case "guest":
-		return errors.New("guest rejimi 4-bosqichda qo'shiladi")
+		return nil
 	}
 	return fmt.Errorf("noma'lum rejim %q (host yoki guest)", mode)
 }
@@ -73,8 +75,11 @@ func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	mode := fs.String("mode", "host", "host yoki guest")
 	stateDir := fs.String("state-dir", "/var/lib/monitor-agent", "holat katalogi")
-	interval := fs.Duration("interval", time.Second, "yig'ish davri")
+	interval := fs.Duration("interval", 0, "asosiy yig'ish davri (host 1s, guest 5s)")
 	bufSize := fs.Int("buffer", 1800, "hub o'chiq paytda saqlanadigan namunalar soni")
+	vmIv := fs.Duration("vm-interval", 5*time.Second, "VM/CT resurslari davri")
+	sensIv := fs.Duration("sensors-interval", 10*time.Second, "harorat/fan/PSU davri")
+	storIv := fs.Duration("storage-interval", 60*time.Second, "disk/RAID davri")
 	fs.Parse(args)
 	if err := checkMode(*mode); err != nil {
 		return err
@@ -82,20 +87,41 @@ func cmdRun(args []string) error {
 
 	// Keep the agent light: few OS threads, soft memory cap.
 	runtime.GOMAXPROCS(2)
-	debug.SetMemoryLimit(40 << 20)
+	limit := int64(40 << 20)
+	if *mode == "guest" {
+		limit = 25 << 20
+	}
+	debug.SetMemoryLimit(limit)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	slog.SetDefault(log)
 	st, err := agent.LoadState(*stateDir)
 	if err != nil {
 		return fmt.Errorf("agent ro'yxatdan o'tmagan (%v): avval 'monitor-agent enroll' ni bajaring", err)
 	}
+	self, err := os.Executable()
+	if err == nil {
+		self, _ = filepath.EvalSymlinks(self)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	log.Info("agent started", "version", version, "mode", *mode, "hub", st.Hub, "agent_id", st.AgentID)
-	return agent.Run(ctx, agent.Config{
-		StateDir: *stateDir, Interval: *interval, BufferSize: *bufSize, BatchSize: 300,
+	err = agent.Run(ctx, agent.Config{
+		StateDir: *stateDir, Interval: *interval, BufferSize: *bufSize,
 		Version: version, Mode: *mode,
+		VMInterval: *vmIv, SensorsInterval: *sensIv, StorageInterval: *storIv,
+		OnUpdate: func(newBin string, o *model.UpdateOrder) error {
+			if self == "" {
+				return errors.New("own path unknown")
+			}
+			return agent.ReplaceBinary(self, newBin)
+		},
 	}, st, log)
+	if errors.Is(err, agent.ErrRestart) {
+		log.Info("exiting so systemd starts the updated binary")
+		return nil
+	}
+	return err
 }
 
 func cmdEnroll(args []string) error {
@@ -118,7 +144,7 @@ func cmdEnroll(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	info := collector.ReadInfo("/proc", *mode, version)
+	info := agent.BuildInfo(*mode, version)
 	resp, err := c.Enroll(ctx, *token, info)
 	if err != nil {
 		return err
@@ -134,11 +160,34 @@ func cmdEnroll(args []string) error {
 }
 
 func cmdCollect() error {
+	ctx := context.Background()
 	h := collector.NewHost()
-	h.Collect(time.Now())
+	pve := collector.NewProxmox()
+	procs := collector.NewProcs()
+	dock := collector.NewDocker()
+	isPVE := collector.IsProxmox("/etc/pve")
+	t0 := time.Now()
+	h.Collect(t0)
+	if isPVE {
+		pve.Collect(t0)
+	}
+	procs.Collect(t0)
+	if dock.Available() {
+		dock.Collect(ctx, t0)
+	}
 	time.Sleep(time.Second)
-	s := h.Collect(time.Now())
-	out := map[string]any{"info": collector.ReadInfo("/proc", "host", version), "sample": s}
+	now := time.Now()
+	out := map[string]any{"info": agent.BuildInfo("host", version), "sample": h.Collect(now)}
+	if isPVE {
+		out["vms"] = pve.Collect(now)
+	}
+	out["net"] = collector.HostNet("/sys", now)
+	out["storage"] = collector.NewStorage().Collect(ctx, now)
+	out["sensors"] = collector.NewSensors(os.TempDir()).Collect(ctx, now)
+	out["procs"] = procs.Collect(now)
+	if dock.Available() {
+		out["docker"] = dock.Collect(ctx, now)
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)

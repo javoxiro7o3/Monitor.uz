@@ -36,7 +36,11 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(func() { st.Close() })
 	web := fstest.MapFS{"index.html": {Data: []byte("<html>ok</html>")}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, err := New(context.Background(), Config{Version: "test", OfflineTimeout: 30 * time.Second, Web: web}, st, log)
+	box, err := store.OpenBox(filepath.Join(t.TempDir(), "secret.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(context.Background(), Config{Version: "test", OfflineTimeout: 30 * time.Second, Web: web, Box: box, NoAuth: true, DataDir: t.TempDir(), DistDir: t.TempDir()}, st, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +93,7 @@ func TestEnrollIngestStream(t *testing.T) {
 	// Ingest with the permanent token.
 	ac, _ := agent.NewClient(e.ts.URL, e.pin, er.Token)
 	now := time.Now().UnixMilli()
-	err = ac.Ingest(ctx, &model.IngestRequest{Info: &info, Samples: []model.Sample{
+	_, err = ac.Ingest(ctx, &model.IngestRequest{Info: &info, Samples: []model.Sample{
 		{TS: now - 1000, CPU: &model.CPU{Usage: 10}},
 		{TS: now, CPU: &model.CPU{Usage: 20}},
 	}})
@@ -113,7 +117,7 @@ func TestEnrollIngestStream(t *testing.T) {
 
 	// Wrong token is rejected.
 	bad, _ := agent.NewClient(e.ts.URL, e.pin, "nope")
-	if err := bad.Ingest(ctx, &model.IngestRequest{}); err != agent.ErrUnauthorized {
+	if _, err := bad.Ingest(ctx, &model.IngestRequest{}); err != agent.ErrUnauthorized {
 		t.Fatalf("bad token: %v", err)
 	}
 
@@ -146,7 +150,7 @@ func TestInstallScriptAndHeaders(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	s := string(body)
-	if !strings.Contains(s, "HUB_URL='"+e.ts.URL+"'") || !strings.Contains(s, "PIN='"+e.pin+"'") || !strings.Contains(s, "ExecStart=/usr/local/bin/monitor-agent run") {
+	if !strings.Contains(s, "HUB_URL='"+e.ts.URL+"'") || !strings.Contains(s, "PIN='"+e.pin+"'") || !strings.Contains(s, "monitor-agent run --mode=host") || !strings.Contains(s, "monitor-agent run --mode=guest") {
 		t.Fatalf("install script incomplete:\n%s", s)
 	}
 	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") {

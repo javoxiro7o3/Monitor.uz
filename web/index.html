@@ -9,10 +9,23 @@
   <link rel="preload" href="/static/fonts/space-grotesk-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/style.css">
   <script src="/static/charts.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/core.js" defer></script>
+  <script src="/static/pages-main.js" defer></script>
+  <script src="/static/pages-more.js" defer></script>
+  <script src="/static/pages-settings.js" defer></script>
 </head>
 <body>
-  <div class="app">
+  <div class="login" id="login" hidden>
+    <div class="login-box">
+      <div class="brand login-brand">
+        <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="15"/><path d="M17 45V26c0-6 7.5-8 10.5-3L32 31.5 36.5 23c3-5 10.5-3 10.5 3v19" fill="none" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="brand-name">Monitor<span>.uz</span></span>
+      </div>
+      <p class="muted login-tag" data-i18n="app.tagline"></p>
+      <form class="card login-form" id="login-form" autocomplete="on"></form>
+    </div>
+  </div>
+  <div class="app" hidden>
     <aside class="sidebar">
       <a class="brand" href="#/">
         <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="15"/><path d="M17 45V26c0-6 7.5-8 10.5-3L32 31.5 36.5 23c3-5 10.5-3 10.5 3v19" fill="none" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -24,11 +37,12 @@
     <div class="scrim"></div>
     <main class="main">
       <header class="topbar">
-        <div>
+        <div class="title-box">
           <h1 id="page-title"></h1>
           <div class="sub" id="page-sub"></div>
         </div>
         <div class="top-actions" id="top-actions">
+          <span id="page-actions"></span>
           <span class="pill live" id="live"><i class="dot"></i><span class="txt"></span></span>
           <button class="icon-btn" id="theme-btn" type="button"></button>
           <button class="icon-btn menu-btn" id="menu-btn" type="button" data-i18n-title="nav.menu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
@@ -37,5 +51,6 @@
       <div id="view"></div>
     </main>
   </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

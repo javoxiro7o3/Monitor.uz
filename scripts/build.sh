@@ -25,9 +25,9 @@ go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/bin/monitor-agent" ./cmd/agent
 
 # Agent binaries the hub serves to the install script (/dl/...).
 cp "$OUT/bin/monitor-agent" "$OUT/dist/monitor-agent-linux-$GOARCH"
-(cd "$OUT/dist" && sha256sum monitor-agent-linux-* > SHA256SUMS)
+(cd "$OUT/dist" && sha256sum monitor-agent-linux-* > SHA256SUMS && echo "$VERSION" > VERSION)
 
-cp deploy/systemd/monitor-hub.service deploy/systemd/monitor-agent.service "$OUT/systemd/"
+cp deploy/systemd/*.service "$OUT/systemd/"
 cp scripts/install-hub.sh "$OUT/"
 cp README.md "$OUT/docs/"
 cp docs/*.md "$OUT/docs/"

@@ -26,7 +26,6 @@ fi
 
 if systemctl is-active --quiet monitor-hub; then systemctl stop monitor-hub; fi
 install -m 0755 bin/monitor-hub /usr/local/bin/monitor-hub
-install -m 0755 bin/monitor-agent /usr/local/bin/monitor-agent
 install -d -m 0750 -o monitor-hub -g monitor-hub /var/lib/monitor-hub /var/lib/monitor-hub/dist
 # Agent binaries offered to hosts by the install script.
 install -m 0644 -o monitor-hub -g monitor-hub dist/* /var/lib/monitor-hub/dist/
@@ -51,10 +50,15 @@ fi
 install -m 0644 systemd/monitor-hub.service /etc/systemd/system/monitor-hub.service
 systemctl daemon-reload
 systemctl enable --now monitor-hub
-sleep 2
+sleep 3
 systemctl --no-pager --lines=5 status monitor-hub || true
 . /etc/monitor-hub/hub.env
 echo
 echo "Hub ishlayapti: $MONITOR_HUB_URL"
 echo "Pin: $(/usr/local/bin/monitor-hub pin --data /var/lib/monitor-hub)"
-echo "Agent uchun token: sudo -u monitor-hub monitor-hub token --note srv-01"
+if [ -f /var/lib/monitor-hub/setup-code ]; then
+	echo
+	echo "Birinchi admin uchun o'rnatish kodi: $(cat /var/lib/monitor-hub/setup-code)"
+	echo "Brauzerda $MONITOR_HUB_URL ni oching va shu kod bilan admin yarating."
+fi
+echo "Agentlar: panel -> Sozlamalar -> Agentlar -> Token yaratish."

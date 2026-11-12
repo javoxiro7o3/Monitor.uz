@@ -1,6 +1,6 @@
 // Package api is the hub's HTTP layer: agent enrollment and ingest, the
-// panel's JSON API, the live SSE stream, the install script and the
-// embedded web UI.
+// panel's JSON API (behind login), the live SSE stream, alerts, settings,
+// the install script and the embedded web UI.
 package api
 
 import (
@@ -19,10 +19,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
 	"monitor.uz/deploy"
+	"monitor.uz/internal/alert"
+	"monitor.uz/internal/auth"
 	"monitor.uz/internal/model"
 	"monitor.uz/internal/store"
 )
@@ -32,9 +35,12 @@ type Config struct {
 	Version        string
 	PublicURL      string        // https://hub:8443, used in the install script
 	Pin            string        // SPKI pin of the hub certificate
+	DataDir        string        // hub data dir (setup code file)
 	DistDir        string        // agent binaries served under /dl/
 	OfflineTimeout time.Duration // no data for this long => offline (30 s)
 	Web            fs.FS         // embedded panel
+	Box            *store.Box    // secret encryption
+	NoAuth         bool          // tests only
 }
 
 // Server holds hub runtime state.
@@ -46,9 +52,22 @@ type Server struct {
 	broker  *broker
 	install *template.Template
 	started time.Time
+
+	engine   *alert.Engine
+	notifier *alert.Notifier
+
+	setMu     sync.RWMutex
+	rules     alert.Rules
+	overrides alert.Overrides
+
+	sessions  *sessionCache
+	ipLimit   *auth.Limiter
+	userLimit *auth.Limiter
+	setupCode string
+	pendTOTP  sync.Map // user id -> pending TOTP secret during enrolment
 }
 
-// New creates the server and loads agents from the store.
+// New creates the server and loads state from the store.
 func New(ctx context.Context, cfg Config, st *store.Store, log *slog.Logger) (*Server, error) {
 	agents, err := st.Agents(ctx)
 	if err != nil {
@@ -61,13 +80,45 @@ func New(ctx context.Context, cfg Config, st *store.Store, log *slog.Logger) (*S
 	if cfg.OfflineTimeout <= 0 {
 		cfg.OfflineTimeout = 30 * time.Second
 	}
-	return &Server{
+	s := &Server{
 		cfg: cfg, store: st, log: log,
-		live:    newLive(agents, cfg.OfflineTimeout),
-		broker:  newBroker(),
-		install: tmpl,
-		started: time.Now(),
-	}, nil
+		live:      newLive(agents, cfg.OfflineTimeout),
+		broker:    newBroker(),
+		install:   tmpl,
+		started:   time.Now(),
+		sessions:  newSessionCache(),
+		ipLimit:   auth.NewLimiter(20, 15*time.Minute),
+		userLimit: auth.NewLimiter(5, 15*time.Minute),
+		rules:     alert.DefaultRules(),
+	}
+	if saved, err := st.LoadReports(ctx); err == nil {
+		s.live.restoreReports(saved)
+	}
+	if err := st.GetJSON(ctx, "alert_rules", &s.rules); err != nil {
+		log.Warn("alert rules unreadable, using defaults", "err", err)
+	}
+	if err := st.GetJSON(ctx, "overrides", &s.overrides); err != nil {
+		log.Warn("overrides unreadable", "err", err)
+	}
+	if d, err := st.DesiredVersions(ctx); err == nil {
+		s.live.setDesired(d)
+	}
+	s.notifier = alert.NewNotifier(log)
+	if wc, err := s.loadWebhook(ctx); err == nil {
+		s.notifier.Configure(wc)
+	} else {
+		log.Error("webhook settings unreadable", "err", err)
+	}
+	s.engine, err = alert.NewEngine(ctx, st, s.notifier, log,
+		func(e alert.Event) { s.broker.publish("alert", e) }, s.live.name)
+	if err != nil {
+		return nil, err
+	}
+	s.live.setHealth(s.engine.Health())
+	if err := s.initSetup(ctx); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // Handler returns the HTTP routes.
@@ -76,29 +127,65 @@ func (s *Server) Handler() http.Handler {
 	// Agent endpoints (authenticated by tokens)
 	mux.HandleFunc("POST /api/v1/enroll", s.handleEnroll)
 	mux.HandleFunc("POST /api/v1/ingest", s.handleIngest)
-	// Panel API
-	mux.HandleFunc("GET /api/v1/hub", s.handleHub)
-	mux.HandleFunc("GET /api/v1/agents", s.handleAgents)
-	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleAgent)
-	mux.HandleFunc("GET /api/v1/agents/{id}/history", s.handleHistory)
-	mux.HandleFunc("GET /api/v1/agents/{id}/keys", s.handleKeys)
-	mux.HandleFunc("GET /api/v1/stream", s.handleStream)
-	// Installation
+	// Installation (public: script and binaries contain no secrets)
 	mux.HandleFunc("GET /install.sh", s.handleInstallScript)
 	mux.HandleFunc("GET /dl/{name}", s.handleDownload)
-	// Panel
+	mux.HandleFunc("GET /dl/agent/{version}/{name}", s.handleDownloadVersion)
+	// Login
+	mux.HandleFunc("GET /api/v1/auth/state", s.handleAuthState)
+	mux.HandleFunc("POST /api/v1/auth/setup", s.handleSetup)
+	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+
+	// Panel API (session required)
+	p := func(pattern string, h http.HandlerFunc) { mux.Handle(pattern, s.requireAuth(h)) }
+	p("GET /api/v1/hub", s.handleHub)
+	p("GET /api/v1/agents", s.handleAgents)
+	p("GET /api/v1/agents/{id}", s.handleAgent)
+	p("GET /api/v1/agents/{id}/history", s.handleHistory)
+	p("GET /api/v1/agents/{id}/keys", s.handleKeys)
+	p("GET /api/v1/stream", s.handleStream)
+	p("POST /api/v1/auth/password", s.handlePassword)
+	p("POST /api/v1/auth/totp/begin", s.handleTOTPBegin)
+	p("POST /api/v1/auth/totp/enable", s.handleTOTPEnable)
+	p("POST /api/v1/auth/totp/disable", s.handleTOTPDisable)
+	p("GET /api/v1/users", s.handleUsers)
+	p("POST /api/v1/users", s.handleUserCreate)
+	p("DELETE /api/v1/users/{id}", s.handleUserDelete)
+	p("POST /api/v1/tokens", s.handleTokenCreate)
+	p("POST /api/v1/agents/{id}/revoke", s.handleAgentRevoke)
+	p("DELETE /api/v1/agents/{id}", s.handleAgentDelete)
+	p("POST /api/v1/agents/{id}/update", s.handleAgentUpdate)
+	p("GET /api/v1/agent-versions", s.handleVersions)
+	p("POST /api/v1/agent-versions", s.handleVersionUpload)
+	p("POST /api/v1/agent-versions/{version}/default", s.handleVersionDefault)
+	p("GET /api/v1/alerts", s.handleAlerts)
+	p("POST /api/v1/alerts/{id}/silence", s.handleAlertSilence)
+	p("GET /api/v1/alert-settings", s.handleAlertSettings)
+	p("PUT /api/v1/alert-settings", s.handleAlertSettingsPut)
+	p("POST /api/v1/alert-settings/test", s.handleWebhookTest)
+	p("GET /api/v1/monitoring", s.handleOverrides)
+	p("PUT /api/v1/monitoring", s.handleOverridePut)
+
+	// Panel files (public; the app shows the login screen)
 	mux.Handle("GET /", s.static())
 	return securityHeaders(mux)
 }
 
 // Background runs periodic jobs until ctx is cancelled.
 func (s *Server) Background(ctx context.Context) {
+	go s.notifier.Run(ctx)
 	offline := time.NewTicker(2 * time.Second)
+	alerts := time.NewTicker(5 * time.Second)
 	persist := time.NewTicker(15 * time.Second)
 	maintain := time.NewTicker(time.Minute)
 	defer offline.Stop()
+	defer alerts.Stop()
 	defer persist.Stop()
 	defer maintain.Stop()
+	// First alert evaluation waits one offline timeout after start, so
+	// agents have a chance to reconnect before "offline" fires.
+	alertsFrom := time.Now().Add(s.cfg.OfflineTimeout + 5*time.Second)
 	for {
 		select {
 		case <-ctx.Done():
@@ -109,6 +196,13 @@ func (s *Server) Background(ctx context.Context) {
 				s.log.Warn("agent offline", "agent", v.Name, "id", v.ID)
 				s.broker.publish("status", statusMsg(v))
 			}
+		case now := <-alerts.C:
+			if now.Before(alertsFrom) {
+				// Before the first evaluation, agents restored from the
+				// database count as offline only if they were offline.
+				continue
+			}
+			s.evalAlerts(ctx, now)
 		case <-persist.C:
 			s.persistSeen(ctx)
 		case now := <-maintain.C:
@@ -118,6 +212,21 @@ func (s *Server) Background(ctx context.Context) {
 			} else if d := time.Since(t0); d > 5*time.Second {
 				s.log.Warn("maintenance slow", "took", d)
 			}
+			s.store.PurgeAlerts(ctx, now.Add(-s.store.HistoryRetention).UnixMilli())
+			s.store.PurgeSessions(ctx, now.UnixMilli(), now.Add(-sessionIdle).UnixMilli())
+			s.sessions.purge(now)
+		}
+	}
+}
+
+func (s *Server) evalAlerts(ctx context.Context, now time.Time) {
+	s.setMu.RLock()
+	rules, ov := s.rules, s.overrides
+	s.setMu.RUnlock()
+	s.engine.Tick(ctx, now, rules, ov, s.live.alertStates())
+	for _, id := range s.live.setHealth(s.engine.Health()) {
+		if v, ok := s.live.get(id); ok {
+			s.broker.publish("health", map[string]any{"id": id, "health": v.Health})
 		}
 	}
 }
@@ -133,7 +242,7 @@ func statusMsg(v AgentView) map[string]any {
 }
 
 func (s *Server) snapshot() map[string]any {
-	return map[string]any{"hub": s.hubInfo(), "agents": s.live.list()}
+	return map[string]any{"hub": s.hubInfo(), "agents": s.live.list(), "alerts": s.engine.Active()}
 }
 
 func (s *Server) hubInfo() map[string]any {
@@ -142,10 +251,11 @@ func (s *Server) hubInfo() map[string]any {
 		"started":         s.started.UnixMilli(),
 		"now":             time.Now().UnixMilli(),
 		"offline_timeout": s.cfg.OfflineTimeout.Milliseconds(),
+		"history_ms":      s.store.HistoryRetention.Milliseconds(),
 	}
 }
 
-// --- agent endpoints ---
+// --- helpers ---
 
 const maxBody = 32 << 20 // decompressed request limit
 
@@ -173,6 +283,17 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "noto'g'ri ID")
+		return 0, false
+	}
+	return id, true
+}
+
+// --- agent endpoints ---
+
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req model.EnrollRequest
 	if err := readJSON(r, &req); err != nil {
@@ -196,7 +317,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	s.log.Info("agent enrolled", "id", id, "hostname", req.Info.Hostname, "remote", r.RemoteAddr)
+	s.log.Info("agent enrolled", "id", id, "hostname", req.Info.Hostname, "mode", req.Info.Mode, "remote", r.RemoteAddr)
 	if agents, err := s.store.Agents(r.Context()); err == nil {
 		for _, a := range agents {
 			if a.ID == id {
@@ -213,7 +334,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "token required")
 		return
 	}
-	id, err := s.store.AgentByToken(r.Context(), tok)
+	ctx := r.Context()
+	id, err := s.store.AgentByToken(ctx, tok)
 	if errors.Is(err, store.ErrInvalidToken) {
 		errJSON(w, http.StatusUnauthorized, "invalid token")
 		return
@@ -228,13 +350,13 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sort.Slice(req.Samples, func(i, j int) bool { return req.Samples[i].TS < req.Samples[j].TS })
-	if err := s.store.InsertSamples(r.Context(), id, req.Samples); err != nil {
+	if err := s.store.InsertSamples(ctx, id, req.Samples); err != nil {
 		s.log.Error("storing samples failed", "agent", id, "err", err)
 		errJSON(w, http.StatusServiceUnavailable, "store error")
 		return
 	}
 	if req.Info != nil {
-		if err := s.store.UpdateAgentInfo(r.Context(), id, *req.Info); err != nil {
+		if err := s.store.UpdateAgentInfo(ctx, id, *req.Info); err != nil {
 			s.log.Error("storing agent info failed", "agent", id, "err", err)
 		}
 	}
@@ -254,10 +376,80 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		s.broker.publish("sample", map[string]any{"id": id, "s": newest})
 	}
 	if len(req.Samples) > 1 {
-		// Buffered data arrived: tell panels to refetch history.
 		s.broker.publish("backfill", map[string]any{"id": id, "from": req.Samples[0].TS, "to": newest.TS})
 	}
-	w.WriteHeader(http.StatusNoContent)
+	if req.Reports != nil {
+		s.ingestReports(ctx, id, req.Reports)
+	}
+	writeJSON(w, http.StatusOK, model.IngestResponse{Update: s.updateOrder(ctx, id, req.Info)})
+}
+
+func (s *Server) ingestReports(ctx context.Context, id int64, r *model.Reports) {
+	changed := s.live.setReports(id, r)
+	for kind, v := range changed {
+		var ts int64
+		var series map[string]float64
+		switch x := v.(type) {
+		case *model.VMReport:
+			ts, series = x.TS, x.Flatten()
+		case *model.DockerReport:
+			ts, series = x.TS, x.Flatten()
+		case *model.SensorReport:
+			ts, series = x.TS, x.Flatten()
+		case *model.HostNetReport:
+			ts = x.TS
+		case *model.StorageReport:
+			ts = x.TS
+		case *model.ProcReport:
+			ts = x.TS
+		}
+		if kind != "procs" { // processes change every 5 s; not worth a disk write
+			if err := s.store.SaveReport(ctx, id, kind, ts, v); err != nil {
+				s.log.Error("saving report failed", "kind", kind, "err", err)
+			}
+		}
+		if len(series) > 0 {
+			if err := s.store.InsertPoints(ctx, id, ts, series); err != nil {
+				s.log.Error("storing report series failed", "kind", kind, "err", err)
+			}
+		}
+		s.broker.publish("report", map[string]any{"id": id, "kind": kind, "data": v})
+	}
+}
+
+// updateOrder returns an update instruction when the admin chose another
+// version for this agent and that binary is available for its arch.
+func (s *Server) updateOrder(ctx context.Context, id int64, info *model.Info) *model.UpdateOrder {
+	desired, err := s.store.DesiredVersions(ctx)
+	if err != nil {
+		return nil
+	}
+	want := desired[id]
+	if want == "" {
+		return nil
+	}
+	cur, arch := s.live.version(id)
+	if info != nil {
+		cur, arch = info.Version, info.Arch
+	}
+	if cur == want {
+		s.store.SetDesiredVersion(ctx, id, "")
+		if d, err := s.store.DesiredVersions(ctx); err == nil {
+			s.live.setDesired(d)
+		}
+		s.log.Info("agent reached desired version", "agent", id, "version", want)
+		return nil
+	}
+	if arch == "" {
+		arch = "amd64"
+	}
+	vs, _ := s.store.AgentVersions(ctx)
+	for _, v := range vs {
+		if v.Version == want && v.Arch == arch {
+			return &model.UpdateOrder{Version: want, SHA256: v.SHA256, URL: "/dl/agent/" + want + "/monitor-agent-linux-" + arch}
+		}
+	}
+	return nil
 }
 
 // --- panel API ---
@@ -270,23 +462,14 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.live.list())
 }
 
-func agentID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "bad id")
-		return 0, false
-	}
-	return id, true
-}
-
 func (s *Server) handleAgent(w http.ResponseWriter, r *http.Request) {
-	id, ok := agentID(w, r)
+	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
 	v, ok := s.live.get(id)
 	if !ok {
-		errJSON(w, http.StatusNotFound, "not found")
+		errJSON(w, http.StatusNotFound, "topilmadi")
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
@@ -294,7 +477,7 @@ func (s *Server) handleAgent(w http.ResponseWriter, r *http.Request) {
 
 // handleHistory: ?key=cpu.usage&key=mem.used_pct&from=<ms>&to=<ms>&points=600
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	id, ok := agentID(w, r)
+	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
@@ -328,7 +511,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
-	id, ok := agentID(w, r)
+	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
@@ -348,9 +531,10 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	err := s.install.Execute(&buf, map[string]string{
-		"HubURL": s.cfg.PublicURL,
-		"Pin":    s.cfg.Pin,
-		"Unit":   deploy.AgentUnit,
+		"HubURL":    s.cfg.PublicURL,
+		"Pin":       s.cfg.Pin,
+		"HostUnit":  deploy.AgentUnit,
+		"GuestUnit": deploy.GuestUnit,
 	})
 	if err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
@@ -361,15 +545,20 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf.Bytes())
 }
 
-var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if !safeName.MatchString(name) || s.cfg.DistDir == "" {
+func (s *Server) serveDist(w http.ResponseWriter, r *http.Request, parts ...string) {
+	for _, p := range parts {
+		if !safeName.MatchString(p) {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	if s.cfg.DistDir == "" {
 		http.NotFound(w, r)
 		return
 	}
-	p := filepath.Join(s.cfg.DistDir, name)
+	p := filepath.Join(append([]string{s.cfg.DistDir}, parts...)...)
 	if fi, err := os.Stat(p); err != nil || !fi.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
@@ -377,6 +566,14 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, p)
+}
+
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	s.serveDist(w, r, r.PathValue("name"))
+}
+
+func (s *Server) handleDownloadVersion(w http.ResponseWriter, r *http.Request) {
+	s.serveDist(w, r, "agent", r.PathValue("version"), r.PathValue("name"))
 }
 
 // --- panel static files ---
@@ -394,7 +591,7 @@ func (s *Server) static() http.Handler {
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; font-src 'self'; media-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")

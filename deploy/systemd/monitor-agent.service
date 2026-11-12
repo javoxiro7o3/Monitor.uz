@@ -1,32 +1,30 @@
-# Monitor.uz agent (host mode). Installed by install-agent.sh.
-# Read-only: reads /proc and /sys, opens no listening port, only outgoing
-# HTTPS to the hub.
+# Monitor.uz agent, host mode (Proxmox VE node). Installed by install.sh.
+#
+# Runs as root with a reduced capability set because the hardware tools
+# need it: ssacli (Smart Array), smartctl (SMART), ipmitool (/dev/ipmi0),
+# and reading /etc/pve. The agent itself only reads; it opens no
+# listening port and only connects out to the hub over HTTPS.
 [Unit]
-Description=Monitor.uz agent
-Documentation=file:///usr/local/share/doc/monitor-uz/README.md
-After=network-online.target
+Description=Monitor.uz agent (host)
+After=network-online.target pve-cluster.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=monitor-agent
-Group=monitor-agent
-ExecStart=/usr/local/bin/monitor-agent run --mode=host --state-dir=/var/lib/monitor-agent
+ExecStart=/usr/local/lib/monitor-agent/monitor-agent run --mode=host --state-dir=/var/lib/monitor-agent
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
 StateDirectory=monitor-agent
-StateDirectoryMode=0750
+StateDirectoryMode=0700
 Nice=10
 
-# Hardening (systemd >= 247; Debian 12 has 252, Debian 13 has 257)
 NoNewPrivileges=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-ProtectSystem=strict
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+ProtectSystem=full
+ReadWritePaths=/usr/local/lib/monitor-agent
 ProtectHome=read-only
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -34,14 +32,12 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictSUIDSGID=yes
-RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 UMask=0077
-MemoryMax=100M
+MemoryMax=150M
 
 [Install]
 WantedBy=multi-user.target

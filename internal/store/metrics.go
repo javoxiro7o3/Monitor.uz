@@ -20,7 +20,20 @@ const (
 
 // InsertSamples stores raw values of an agent's samples in one transaction.
 func (s *Store) InsertSamples(ctx context.Context, agentID int64, samples []model.Sample) error {
-	if len(samples) == 0 {
+	pts := make([]flatPoint, 0, len(samples))
+	for i := range samples {
+		pts = append(pts, flatPoint{samples[i].TS, samples[i].Flatten()})
+	}
+	return s.insertFlat(ctx, agentID, pts)
+}
+
+type flatPoint struct {
+	ts   int64
+	vals map[string]float64
+}
+
+func (s *Store) insertFlat(ctx context.Context, agentID int64, pts []flatPoint) error {
+	if len(pts) == 0 {
 		return nil
 	}
 	s.mu.Lock()
@@ -45,9 +58,8 @@ func (s *Store) InsertSamples(ctx context.Context, agentID int64, samples []mode
 	}
 	created := map[string]int64{}
 	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
-	for i := range samples {
-		ts := samples[i].TS
-		for key, v := range samples[i].Flatten() {
+	for _, p := range pts {
+		for key, v := range p.vals {
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				continue
 			}
@@ -60,11 +72,11 @@ func (s *Store) InsertSamples(ctx context.Context, agentID int64, samples []mode
 					created[key] = id
 				}
 			}
-			if _, err := ins.ExecContext(ctx, id, ts, v); err != nil {
+			if _, err := ins.ExecContext(ctx, id, p.ts, v); err != nil {
 				return err
 			}
 		}
-		minTS, maxTS = min(minTS, ts), max(maxTS, ts)
+		minTS, maxTS = min(minTS, p.ts), max(maxTS, p.ts)
 	}
 	if err := tx.Commit(); err != nil {
 		return err

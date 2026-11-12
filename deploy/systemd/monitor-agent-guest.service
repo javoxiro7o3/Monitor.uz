@@ -1,0 +1,46 @@
+# Monitor.uz agent, guest mode (Linux VM / Debian CT with Docker).
+# Runs as the unprivileged monitor-agent user; Docker socket access comes
+# from the docker group (only GET requests are made).
+[Unit]
+Description=Monitor.uz agent (guest)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor-agent
+Group=monitor-agent
+{{SUPPLEMENTARY}}ExecStart=/usr/local/lib/monitor-agent/monitor-agent run --mode=guest --state-dir=/var/lib/monitor-agent
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StateDirectory=monitor-agent
+StateDirectoryMode=0700
+Nice=10
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/usr/local/lib/monitor-agent
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+UMask=0077
+MemoryMax=80M
+
+[Install]
+WantedBy=multi-user.target

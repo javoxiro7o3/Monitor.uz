@@ -113,7 +113,7 @@ func (c *Client) post(ctx context.Context, path string, body any, out any) error
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("hub: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
-	if out != nil {
+	if out != nil && resp.StatusCode == http.StatusOK {
 		return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 	}
 	io.Copy(io.Discard, resp.Body)
@@ -132,7 +132,45 @@ func (c *Client) Enroll(ctx context.Context, installToken string, info model.Inf
 	return &r, nil
 }
 
-// Ingest delivers a batch of samples.
-func (c *Client) Ingest(ctx context.Context, req *model.IngestRequest) error {
-	return c.post(ctx, "/api/v1/ingest", req, nil)
+// Ingest delivers a batch of samples. The response may carry an update
+// order.
+func (c *Client) Ingest(ctx context.Context, req *model.IngestRequest) (*model.IngestResponse, error) {
+	var r model.IngestResponse
+	if err := c.post(ctx, "/api/v1/ingest", req, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// Download fetches a file from the hub (pinned TLS, agent token) into dst.
+func (c *Client) Download(ctx context.Context, path, dst string, limit int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.hub+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	cl := *c.http
+	cl.Timeout = 5 * time.Minute
+	resp, err := cl.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download %s: %s", path, resp.Status)
+	}
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o700)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(f, io.LimitReader(resp.Body, limit+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && n > limit {
+		err = errors.New("file too large")
+	}
+	return err
 }

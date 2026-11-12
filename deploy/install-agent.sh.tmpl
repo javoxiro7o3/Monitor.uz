@@ -1,13 +1,16 @@
 #!/bin/sh
 # Monitor.uz agent o'rnatish skripti. Hub tomonidan yaratiladi:
-#   curl -fsS --insecure --pinnedpubkey 'sha256//PIN' HUB/install.sh | sh -s -- --token TOKEN
-# Hamma narsa hub'dan olinadi, internet kerak emas.
+#   curl -fsS --insecure --pinnedpubkey 'sha256//PIN' HUB/install.sh | sh -s -- --token TOKEN [--mode guest]
+# Hamma narsa hub'dan olinadi, internet kerak emas. Qayta ishga tushirish
+# xavfsiz: agent yangilanadi, ID va tarix saqlanadi.
 set -eu
 
 HUB_URL='{{.HubURL}}'
 PIN='{{.Pin}}'
 TOKEN=''
 MODE='host'
+LIB=/usr/local/lib/monitor-agent
+STATE=/var/lib/monitor-agent
 
 die() { echo "XATO: $*" >&2; exit 1; }
 
@@ -21,8 +24,8 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "root huquqi kerak (sudo bilan ishga tushiring)"
 [ -n "$TOKEN" ] || die "--token berilmagan"
-[ "$MODE" = "host" ] || die "hozircha faqat --mode host qo'llab-quvvatlanadi"
-command -v curl >/dev/null 2>&1 || die "curl topilmadi"
+case "$MODE" in host|guest) ;; *) die "--mode host yoki guest bo'lishi kerak" ;; esac
+command -v curl >/dev/null 2>&1 || die "curl topilmadi (Debian: apt install curl, paketni ichki omborchadan oling)"
 command -v systemctl >/dev/null 2>&1 || die "systemd topilmadi"
 
 case "$(uname -m)" in
@@ -38,31 +41,53 @@ trap 'rm -rf "$TMP"' EXIT
 # public-key pin, which curl still enforces.
 fetch() { curl -fsS --insecure --pinnedpubkey "sha256//$PIN" -o "$2" "$HUB_URL$1"; }
 
-echo "==> agent yuklanmoqda ($ARCH)"
+echo "==> agent yuklanmoqda ($ARCH, $MODE)"
 fetch "/dl/monitor-agent-linux-$ARCH" "$TMP/monitor-agent" || die "agent faylini hub'dan olib bo'lmadi"
 fetch "/dl/SHA256SUMS" "$TMP/SHA256SUMS" || die "SHA256SUMS olinmadi"
 want=$(awk -v f="monitor-agent-linux-$ARCH" '$2==f {print $1}' "$TMP/SHA256SUMS")
 got=$(sha256sum "$TMP/monitor-agent" | awk '{print $1}')
 [ -n "$want" ] && [ "$want" = "$got" ] || die "nazorat summasi mos kelmadi"
+chmod 0755 "$TMP/monitor-agent"
+"$TMP/monitor-agent" version >/dev/null || die "agent bu tizimda ishga tushmadi"
 
-echo "==> foydalanuvchi va fayllar"
-if ! id monitor-agent >/dev/null 2>&1; then
-	useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin monitor-agent
-fi
+echo "==> fayllar"
 if systemctl is-active --quiet monitor-agent; then systemctl stop monitor-agent; fi
-install -m 0755 "$TMP/monitor-agent" /usr/local/bin/monitor-agent
-install -d -m 0750 -o monitor-agent -g monitor-agent /var/lib/monitor-agent
+install -d -m 0755 "$LIB"
+install -m 0755 "$TMP/monitor-agent" "$LIB/monitor-agent"
+ln -sf "$LIB/monitor-agent" /usr/local/bin/monitor-agent
+install -d -m 0700 "$STATE"
+
+if [ "$MODE" = "guest" ]; then
+	if ! id monitor-agent >/dev/null 2>&1; then
+		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin monitor-agent
+	fi
+fi
 
 echo "==> hub'da ro'yxatdan o'tish"
-/usr/local/bin/monitor-agent enroll --hub "$HUB_URL" --pin "$PIN" --token "$TOKEN" \
-	--mode "$MODE" --state-dir /var/lib/monitor-agent || die "ro'yxatdan o'tib bo'lmadi"
-chown monitor-agent:monitor-agent /var/lib/monitor-agent/state.json
+"$LIB/monitor-agent" enroll --hub "$HUB_URL" --pin "$PIN" --token "$TOKEN" \
+	--mode "$MODE" --state-dir "$STATE" || die "ro'yxatdan o'tib bo'lmadi"
 
 echo "==> systemd xizmati"
-cat >/etc/systemd/system/monitor-agent.service <<'UNIT'
-{{.Unit}}UNIT
+if [ "$MODE" = "host" ]; then
+	cat >/etc/systemd/system/monitor-agent.service <<'UNIT'
+{{.HostUnit}}UNIT
+	for t in ssacli smartctl ipmitool; do
+		command -v "$t" >/dev/null 2>&1 || [ -x "/usr/sbin/$t" ] || echo "  eslatma: $t topilmadi (bu ma'lumot panelda bo'lmaydi)"
+	done
+else
+	chown -R monitor-agent:monitor-agent "$STATE" "$LIB"
+	cat >/etc/systemd/system/monitor-agent.service <<'UNIT'
+{{.GuestUnit}}UNIT
+	if getent group docker >/dev/null 2>&1; then
+		sed -i 's/^{{"{{"}}SUPPLEMENTARY{{"}}"}}/SupplementaryGroups=docker\n/' /etc/systemd/system/monitor-agent.service
+	else
+		sed -i 's/^{{"{{"}}SUPPLEMENTARY{{"}}"}}//' /etc/systemd/system/monitor-agent.service
+		echo "  eslatma: docker guruhi yo'q, konteynerlar ko'rinmaydi"
+	fi
+fi
 systemctl daemon-reload
-systemctl enable --now monitor-agent
+systemctl enable monitor-agent >/dev/null 2>&1
+systemctl restart monitor-agent
 sleep 2
 systemctl --no-pager --lines=0 status monitor-agent || true
 echo "Tayyor. Agent ishlayapti; panelda bir necha soniyada ko'rinadi."

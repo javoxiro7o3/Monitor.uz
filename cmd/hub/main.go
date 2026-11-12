@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"monitor.uz/internal/api"
+	"monitor.uz/internal/auth"
 	"monitor.uz/internal/store"
 	"monitor.uz/internal/tlsutil"
 	"monitor.uz/web"
@@ -38,6 +39,7 @@ Foydalanish:
   monitor-hub agents  [--data DIR]                                agentlar ro'yxati
   monitor-hub revoke  [--data DIR] ID                             agent tokenini bekor qilish
   monitor-hub pin     [--data DIR]                                sertifikat pin'i
+  monitor-hub user list|add NOM|passwd NOM|reset-2fa NOM|del NOM  adminlar (parol stdin'dan)
   monitor-hub version
 
 Sozlamalarni muhit o'zgaruvchilari orqali ham berish mumkin:
@@ -61,6 +63,8 @@ func main() {
 		err = cmdAgents(args)
 	case "revoke":
 		err = cmdRevoke(args)
+	case "user":
+		err = cmdUser(args)
 	case "pin":
 		err = cmdPin(args)
 	case "version", "--version", "-v":
@@ -158,13 +162,18 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	box, err := store.OpenBox(filepath.Join(*data, "secret.key"))
+	if err != nil {
+		return fmt.Errorf("secret key: %w", err)
+	}
 	srv, err := api.New(ctx, api.Config{
-		Version: version, PublicURL: *pubURL, Pin: pin, DistDir: dist,
-		OfflineTimeout: 30 * time.Second, Web: webFS,
+		Version: version, PublicURL: *pubURL, Pin: pin, DistDir: dist, DataDir: *data,
+		OfflineTimeout: 30 * time.Second, Web: webFS, Box: box,
 	}, st, log)
 	if err != nil {
 		return err
 	}
+	srv.RegisterBundledAgent(ctx)
 	go srv.Background(ctx)
 
 	hs := &http.Server{
@@ -317,5 +326,99 @@ func cmdPin(args []string) error {
 		return err
 	}
 	fmt.Println(pin)
+	return nil
+}
+
+func cmdUser(args []string) error {
+	fs := flag.NewFlagSet("user", flag.ExitOnError)
+	data := dataFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		return errors.New("buyruq: list | add NOM | passwd NOM | reset-2fa NOM | del NOM")
+	}
+	st, err := openForCLI(*data)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ctx := context.Background()
+	sub := fs.Arg(0)
+	if sub == "list" {
+		us, err := st.Users(ctx)
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tLOGIN\t2FA\tOXIRGI KIRISH")
+		for _, u := range us {
+			last := "-"
+			if u.LastLogin > 0 {
+				last = time.UnixMilli(u.LastLogin).Format("2006-01-02 15:04")
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%v\t%s\n", u.ID, u.Username, u.TOTPEnabled, last)
+		}
+		return tw.Flush()
+	}
+	if fs.NArg() != 2 {
+		return errors.New("foydalanuvchi nomi kerak")
+	}
+	name := fs.Arg(1)
+	readPass := func() (string, error) {
+		fmt.Fprint(os.Stderr, "Yangi parol (kamida 10 belgi): ")
+		var pw string
+		_, err := fmt.Fscanln(os.Stdin, &pw)
+		if err != nil {
+			return "", errors.New("parol o'qilmadi")
+		}
+		if err := auth.ValidatePassword(pw); err != nil {
+			return "", err
+		}
+		return auth.HashPassword(pw)
+	}
+	switch sub {
+	case "add":
+		h, err := readPass()
+		if err != nil {
+			return err
+		}
+		if _, err := st.CreateUser(ctx, name, h); err != nil {
+			return err
+		}
+		os.Remove(filepath.Join(*data, "setup-code"))
+		fmt.Println("Qo'shildi:", name)
+	case "passwd":
+		u, err := st.UserByName(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%s topilmadi", name)
+		}
+		h, err := readPass()
+		if err != nil {
+			return err
+		}
+		if err := st.SetPassword(ctx, u.ID, h); err != nil {
+			return err
+		}
+		fmt.Println("Parol o'zgartirildi, faol seanslar yopildi. Hub'ni qayta ishga tushiring: systemctl restart monitor-hub")
+	case "reset-2fa":
+		u, err := st.UserByName(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%s topilmadi", name)
+		}
+		if err := st.SetTOTP(ctx, u.ID, "", false); err != nil {
+			return err
+		}
+		fmt.Println("2FA o'chirildi:", name)
+	case "del":
+		u, err := st.UserByName(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%s topilmadi", name)
+		}
+		if err := st.DeleteUser(ctx, u.ID); err != nil {
+			return err
+		}
+		fmt.Println("O'chirildi:", name)
+	default:
+		return errors.New("noma'lum buyruq: " + sub)
+	}
 	return nil
 }

@@ -91,13 +91,18 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{
+	st := &Store{
 		db:               db,
 		RawRetention:     75 * time.Minute,
 		HistoryRetention: 7 * 24 * time.Hour,
 		series:           map[int64]map[string]int64{},
 		dirty:            map[int64][2]int64{},
-	}, nil
+	}
+	if err := st.migrate2(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return st, nil
 }
 
 // Close closes the database.

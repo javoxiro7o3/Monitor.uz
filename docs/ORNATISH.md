@@ -1,124 +1,137 @@
 # O'rnatish (internetsiz)
 
-Paket: `monitor-uz-0.1.0-linux-amd64.tar.gz`. Uni USB orqali hub serveriga ko'chiring va oching:
+Paket: `monitor-uz-0.9.0-linux-amd64.tar.gz`. Uni USB orqali hub serveriga ko'chiring va oching:
 
 ```sh
-tar xzf monitor-uz-0.1.0-linux-amd64.tar.gz
-cd monitor-uz-0.1.0-linux-amd64
-sha256sum bin/*            # ixtiyoriy tekshiruv
+tar xzf monitor-uz-0.9.0-linux-amd64.tar.gz && cd monitor-uz-0.9.0-linux-amd64
 ```
 
 Paket ichida:
 
-```
-bin/monitor-hub  bin/monitor-agent   statik binary'lar (amd64)
-dist/            hub hostlarga tarqatadigan agent fayllari + SHA256SUMS
-systemd/         unit fayllar
-install-hub.sh   hub o'rnatish skripti
-docs/            hujjatlar
-```
+- `bin/` — `monitor-hub` va `monitor-agent` (statik, amd64);
+- `dist/` — hub hostlarga tarqatadigan agent fayli, `SHA256SUMS`, `VERSION`;
+- `systemd/` — unit fayllar;
+- `install-hub.sh` — hub o'rnatish skripti;
+- `docs/` — hujjatlar.
 
 ## 1. Hub
 
-Talab: Debian 12 yoki 13 (VM yoki CT), systemd, hostlar unga 8443-port orqali yeta olishi kerak.
+Talab: Debian 12 yoki 13 (VM yoki CT), systemd. Hostlar va VM lar hub'ga 8443-port orqali yeta olishi kerak.
 
 ```sh
 sudo ./install-hub.sh --url https://10.0.0.5:8443
 ```
 
-`--url` — agentlar va brauzer hub'ga qaysi manzil orqali murojaat qilishi. Hub IP manzilini yozing. Skript quyidagilarni bajaradi:
+Skript quyidagilarni bajaradi:
 
 - `monitor-hub` tizim foydalanuvchisini yaratadi;
-- binary'larni `/usr/local/bin` ga o'rnatadi;
-- ma'lumotlar katalogini yaratadi: `/var/lib/monitor-hub` (`hub.db`, `hub.crt`, `hub.key`, `dist/`);
-- sozlamalarni `/etc/monitor-hub/hub.env` ga yozadi;
-- `monitor-hub` xizmatini yoqadi va ishga tushiradi.
+- binary'ni o'rnatadi;
+- `/var/lib/monitor-hub` (baza, sertifikat, shifrlash kaliti, agent fayllari) va `/etc/monitor-hub/hub.env` ni yaratadi;
+- xizmatni ishga tushiradi.
 
-Birinchi ishga tushishda hub o'zining self-signed sertifikatini yaratadi (ECDSA P-256, 10 yil). Sertifikatga hostname, hub'ning barcha IP manzillari va `--url` dagi manzil kiritiladi. Kerak bo'lsa, qo'shimcha nomlarni `--san 10.0.0.5,monitor.lan` orqali bering.
+Oxirida **o'rnatish kodi** chiqadi: brauzerda `https://10.0.0.5:8443` ni oching va shu kod bilan birinchi adminni yarating. Kodni keyin ham ko'rish mumkin: `sudo cat /var/lib/monitor-hub/setup-code`. Admin yaratilgach, kod o'chiriladi.
 
-Agentlar sertifikatni CA orqali emas, **pin** (ochiq kalitning SHA-256 xeshi) orqali tekshiradi. Shuning uchun `hub.crt`/`hub.key` ni o'chirsangiz yoki almashtirsangiz, barcha agentlarni qayta o'rnatishga to'g'ri keladi. Ularni zaxira nusxaga qo'shing.
+Hub o'zining self-signed sertifikatini yaratadi. Brauzer bir marta ogohlantiradi: istisno qilib qo'shing yoki `/var/lib/monitor-hub/hub.crt` ni ishonchli ro'yxatga kiriting. Agentlar sertifikatni CA orqali emas, ochiq kalit xeshi (**pin**) bo'yicha tekshiradi.
 
-Tekshirish:
+**Zaxira nusxaga albatta oling:** `hub.crt`, `hub.key`, `secret.key`, `hub.db`.
 
-```sh
-systemctl status monitor-hub
-journalctl -u monitor-hub -f
-```
+- `hub.key` yo'qolsa, barcha agentlarni qayta o'rnatish kerak bo'ladi.
+- `secret.key` yo'qolsa, webhook manzili va 2FA kalitlari o'qilmaydi.
 
-Brauzerda `https://10.0.0.5:8443` ni oching. Sertifikat self-signed bo'lgani uchun brauzer bir marta ogohlantiradi. Uni istisno sifatida qabul qiling yoki `hub.crt` ni brauzer/OS ishonchli ro'yxatiga qo'shing.
+## 2. Agent: Proxmox host
 
-> **Diqqat (1-bosqich):** panelda hali login yo'q, u 6-bosqichda qo'shiladi. Hozircha hub'ning 8443-portini faqat adminlar tarmog'idan ochiq qoldiring. Agent API (ingest/enroll) token bilan himoyalangan.
-
-## 2. Agentni Proxmox hostga o'rnatish
-
-Hub'da bir martalik token oling (24 soat amal qiladi):
-
-```sh
-sudo -u monitor-hub monitor-hub token --note srv-01
-```
-
-Buyruqni `root` sifatida emas, `sudo -u monitor-hub` orqali ishga tushiring: aks holda baza fayllari root egaligiga o'tib qolishi mumkin. Dastur buni o'zi tekshiradi va root bo'lsa, ishlashdan bosh tortadi.
-
-Chiqqan buyruqni Proxmox hostda `root` sifatida ishga tushiring:
+Panel → **Sozlamalar → Agentlar** → rejim "Host" → **Token yaratish**. Chiqqan buyruqni hostda `root` sifatida ishga tushiring:
 
 ```sh
 curl -fsS --insecure --pinnedpubkey 'sha256//PIN' https://10.0.0.5:8443/install.sh | sh -s -- --token TOKEN
 ```
 
-- `--insecure` + `--pinnedpubkey`: curl sertifikatni CA bo'yicha tekshirmaydi, lekin uning ochiq kaliti pin bilan mos kelmasa, ulanishni uzadi. Sinovda tekshirildi: noto'g'ri pin bilan xato 90 qaytadi.
-- Skript agentni faqat hub'dan yuklaydi va `SHA256SUMS` bo'yicha tekshiradi.
-- `monitor-agent` tizim foydalanuvchisini, `/var/lib/monitor-agent/state.json` faylini (doimiy token, 0600) va `monitor-agent.service` ni yaratadi.
-- Bir hostga qayta o'rnatish mumkin (yangi token bilan): agent ID va tarix saqlanadi.
+- `--insecure` + `--pinnedpubkey`: curl sertifikatni CA orqali tekshirmaydi, lekin ochiq kalit pin'ga mos kelmasa, ulanishni uzadi.
+- Agent `/usr/local/lib/monitor-agent/` ga o'rnatiladi. `/usr/local/bin/monitor-agent` unga ishora qiladi.
+- Ma'lumotlar `/var/lib/monitor-agent/` da saqlanadi: `state.json` (doimiy token, 0600) va bufer.
 
-Bir necha soniyadan keyin server panelda paydo bo'ladi.
+**Huquqlar.** Host agent `root` sifatida ishlaydi, lekin cheklangan capability to'plami bilan: `CAP_SYS_RAWIO`, `CAP_SYS_ADMIN`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`. Sababi:
 
-Agentni tekshirish:
+- `ssacli` va `smartctl` disk kontrolleriga, `ipmitool` esa `/dev/ipmi0` ga murojaat qiladi;
+- `/etc/pve` faqat root/www-data uchun o'qiladi.
+
+Unitda qo'shimcha cheklovlar ham bor: `NoNewPrivileges`, `ProtectSystem=full`, `ProtectKernel*`, `MemoryMax=150M`. Agent tizimni o'zgartirmaydi: `qm` va `pct` buyruqlarini ham chaqirmaydi, VM/CT ma'lumotini konfig fayllar va cgroup'dan o'qiydi. Yagona yozadigan joyi — o'z katalogi (yangilanish uchun).
+
+**Ixtiyoriy vositalar** (bo'lmasa, tegishli bo'lim "ma'lumot yo'q" deb ko'rsatiladi):
+
+- **ssacli** — HPE saytidan boshqa kompyuterda yuklab, `.deb` ni hostga ko'chiring: `dpkg -i ssacli-*.deb`. Versiyasini yozib qo'ying.
+- **smartctl** — `smartmontools` paketi. Proxmox'da odatda o'rnatilgan.
+- **ipmitool** — `apt install ipmitool` (Proxmox ichki omboridan). Hostda `/dev/ipmi0` paydo bo'lishi uchun kernel modullari kerak: `modprobe ipmi_si ipmi_devintf`.
+
+## 3. Agent: Docker bor VM/CT (guest)
+
+Token yaratishda rejimni **"Guest"** qilib tanlang va buyruqni VM/CT ichida `root` sifatida bajaring (buyruq oxirida `--mode guest` bo'ladi).
+
+- Guest agent root'siz, `monitor-agent` foydalanuvchisi nomidan ishlaydi. Docker socket'ga `docker` guruhi orqali kiradi va faqat GET so'rovlari yuboradi.
+- Guest agent Proxmox'dagi VM/CT ga **MAC manzil** orqali avtomatik bog'lanadi.
+- Talab: `curl` va systemd. Minimal Debian CT da curl bo'lmasa: `apt install curl` (ichki ombordan).
+
+## 4. Alertlar va Mattermost
+
+1. Mattermost'da: **Integrations → Incoming Webhooks → Add** va manzilni nusxalang.
+2. Panelda: **Sozlamalar → Bildirishnomalar** → manzilni kiriting → **Sinov xabari** → **Saqlash**.
+
+Manzil bazada shifrlangan holda saqlanadi, loglarga yozilmaydi. Mattermost hali yo'q bo'lsa, sinov uchun istalgan HTTP qabul qiluvchi (masalan, `nc -l 9000`) yetadi.
+
+Qoidalar va chegaralar: **Alertlar → Qoidalar**. "VM/CT to'xtadi" faqat kuzatiladigan VM/CT lar uchun ishlaydi. Standart holatda avtomatik ishga tushadigan (`onboot: 1`) VM/CT lar kuzatiladi; buni VM ro'yxatidagi "Kuzatiladi" tugmasi bilan o'zgartirish mumkin.
+
+## 5. Agentni yangilash va qaytarish
+
+1. Yangi `monitor-agent` faylini **Sozlamalar → Agentlar → Agent versiyalari** orqali yuklang.
+2. Avval bitta agentni **Yangilash…** ro'yxatidan yangi versiyaga o'tkazing.
+3. Agent keyingi ulanishida faylni oladi, SHA-256 va versiyasini tekshiradi, o'zini almashtiradi va qayta ishga tushadi. Eski fayl `monitor-agent.prev` sifatida saqlanadi.
+4. Muammo bo'lsa, eski versiyani xuddi shu yo'l bilan tanlang.
+
+**O'rnatish uchun tanlash** tugmasi yangi o'rnatishlarda (`install.sh`) qaysi versiya ishlatilishini belgilaydi.
+
+Hub'ni yangilash: yangi paketda `sudo ./install-hub.sh` ni qayta ishga tushiring. Ma'lumotlar saqlanadi.
+
+## 6. Admin buyruqlari (hub serverida)
 
 ```sh
-systemctl status monitor-agent
-journalctl -u monitor-agent -f
-monitor-agent collect      # bitta namunani JSON ko'rinishida chiqaradi (hub'ga yubormaydi)
+sudo -u monitor-hub monitor-hub user list
+sudo -u monitor-hub monitor-hub user add ali           # parolni stdin'dan so'raydi
+sudo -u monitor-hub monitor-hub user passwd ali
+sudo -u monitor-hub monitor-hub user reset-2fa ali     # telefon yo'qolsa
+sudo -u monitor-hub monitor-hub agents
+sudo -u monitor-hub monitor-hub token --note srv-01    # paneldan tashqari token
+monitor-hub pin --data /var/lib/monitor-hub
 ```
 
-### Agent huquqlari
+`sudo -u monitor-hub` bilan ishga tushiring, root bilan emas: aks holda baza fayllari root egaligiga o'tib qolishi mumkin. Dastur buni o'zi tekshiradi.
 
-Agent `monitor-agent` foydalanuvchisi nomidan, root'siz ishlaydi. 1-bosqichda u faqat `/proc` va `/sys` ni o'qiydi. Unitdagi cheklovlar: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateDevices`, bo'sh `CapabilityBoundingSet`, `MemoryMax=100M`, faqat `AF_INET/AF_INET6/AF_UNIX`. Tinglaydigan port yo'q.
+`/etc/monitor-hub/hub.env` sozlamalari:
 
-Root talab qiladigan joylar keyingi bosqichlarda paydo bo'ladi (ssacli, smartctl, `/etc/pve` o'qish). Ular alohida hujjatlashtiriladi.
+- `MONITOR_HUB_URL` — agentlar ulanadigan manzil;
+- `MONITOR_HUB_LISTEN` — tinglash manzili (standart `:8443`);
+- `MONITOR_HUB_SAN` — sertifikatga qo'shimcha nomlar;
+- `MONITOR_HUB_HISTORY` — tarix saqlash muddati (standart `168h`);
+- `MONITOR_HUB_TLS_CERT`, `MONITOR_HUB_TLS_KEY` — ichki CA sertifikatidan foydalanish uchun.
 
-## 3. Boshqarish
+O'zgartirgandan keyin: `systemctl restart monitor-hub`.
 
-```sh
-sudo -u monitor-hub monitor-hub agents          # ro'yxat
-sudo -u monitor-hub monitor-hub revoke 3        # agent tokenini bekor qilish
-monitor-hub pin --data /var/lib/monitor-hub     # pin
-```
+## 7. Xavfsizlik qisqacha
 
-Hub sozlamalari `/etc/monitor-hub/hub.env` da turadi. O'zgartirgandan keyin `systemctl restart monitor-hub` qiling.
+- **Agent → hub:** HTTPS, pin bo'yicha tekshiruv, har agentga alohida token (bazada xesh holida). Bekor qilingan token bilan ma'lumot qabul qilinmaydi.
+- **Panelga kirish:**
+  - Argon2id bilan xeshlangan parollar, kamida 10 belgi;
+  - ixtiyoriy TOTP 2FA;
+  - seans 12 soat amal qiladi, 2 soat harakatsizlikdan keyin yopiladi;
+  - 5 ta noto'g'ri urinishdan keyin hisob 15 daqiqaga bloklanadi, bir IP uchun chegara 20 ta;
+  - cookie `HttpOnly`, `Secure`, `SameSite=Strict`, CSRF uchun alohida sarlavha.
+- **Panel tashqi manzilga murojaat qilmaydi:** CSP `default-src 'self'`.
+- **Panel orqali boshqaruv yo'q:** start/stop ham, terminal ham yo'q.
 
-| O'zgaruvchi | Ma'nosi | Standart |
-|---|---|---|
-| `MONITOR_HUB_URL` | agentlar uchun manzil | — |
-| `MONITOR_HUB_LISTEN` | tinglash manzili | `:8443` |
-| `MONITOR_HUB_SAN` | sertifikatga qo'shimcha IP/nomlar | — |
-| `MONITOR_HUB_HISTORY` | tarix saqlash muddati | `168h` (1 hafta) |
-| `MONITOR_HUB_TLS_CERT` / `_KEY` | tashqi sertifikat (ixtiyoriy) | — |
-
-## 4. Yangilash
-
-Yangi paketni ochib, `sudo ./install-hub.sh` ni qayta ishga tushiring. Ma'lumotlar va `hub.env` saqlanadi. Hostlardagi agentni yangilash uchun hostda yangi token bilan o'rnatish buyrug'ini qayta bajaring. Paneldan boshqariladigan yangilash 6-bosqichda qilinadi.
-
-## 5. O'chirish
+## 8. O'chirish
 
 ```sh
-# host:
-systemctl disable --now monitor-agent && rm -rf /etc/systemd/system/monitor-agent.service /usr/local/bin/monitor-agent /var/lib/monitor-agent && userdel monitor-agent
+# host yoki VM/CT:
+systemctl disable --now monitor-agent; rm -rf /etc/systemd/system/monitor-agent.service /usr/local/lib/monitor-agent /usr/local/bin/monitor-agent /var/lib/monitor-agent
 # hub:
-systemctl disable --now monitor-hub && rm -rf /etc/systemd/system/monitor-hub.service /usr/local/bin/monitor-hub /etc/monitor-hub /var/lib/monitor-hub && userdel monitor-hub
+systemctl disable --now monitor-hub; rm -rf /etc/systemd/system/monitor-hub.service /usr/local/bin/monitor-hub /etc/monitor-hub /var/lib/monitor-hub; userdel monitor-hub
 ```
-
-## Ma'lumot saqlash
-
-- `raw` jadvali: har bir qiymat asl chastotada (1 s). 1 soatdan ko'proq (75 daqiqa) saqlanadi, shunda kechikib kelgan buferlangan ma'lumot ham 10 s o'rtachaga qo'shiladi.
-- `rollup` jadvali: 10 s o'rtachalar, 1 hafta saqlanadi. Har yadro bo'yicha CPU faqat xom holatda (1 soat) saqlanadi, bu bazani ixcham tutadi.
-- Panel 1 soatgacha bo'lgan oraliqlarni xom ma'lumotdan, uzunroqlarini 10 s o'rtachalardan chizadi.
